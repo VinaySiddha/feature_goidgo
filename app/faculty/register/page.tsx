@@ -450,7 +450,7 @@ export default function FacultyRegisterPage() {
     const userKey = user?.name || user?.email || 'Unknown';
     let saved = 0;
     for (const record of previewRecords) {
-      const result = await saveDraftToDb({ ...record, savedBy: userKey }).catch(() => ({ success: false }));
+      const result = await saveDraftToDb({ ...record, savedBy: userKey, updatedAt: new Date().toISOString() }).catch(() => ({ success: false }));
       if (result.success) saved++;
     }
     const drafts = await getDraftsByUser(userKey).catch(() => [] as typeof dbDrafts);
@@ -479,7 +479,11 @@ export default function FacultyRegisterPage() {
       setBatchProgress(null);
       const cfSavePromises = allSaved
         .filter(s => previewCustomVals.has(s.id))
-        .map(s => saveStudentCustomValues(s.id, previewCustomVals.get(s.id)!).catch(() => {}));
+        .map(s => {
+          const vals = previewCustomVals.get(s.id)!;
+          const studentCustomValues = Object.entries(vals).map(([id, value]) => ({ custom_field_id: Number(id), value }));
+          return saveStudentCustomValues(s.id, studentCustomValues).catch(() => {});
+        });
       await Promise.all(cfSavePromises);
       setExcelFile(null); setBulkPhotoMap(new Map()); setPreviewRecords(null); setPreviewCustomVals(new Map()); setBulkImportOpen(false);
       setNotice({ message: `${saved} of ${total} records imported successfully.`, type: 'success' });

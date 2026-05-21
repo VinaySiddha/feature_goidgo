@@ -18,7 +18,7 @@ interface StudentDetailsModalProps {
 }
 
 const EMPTY_FORM = {
-  name: '', parentage: '', phone: '',
+  name: '', parentage: '', phone: '', address: '',
 };
 
 export default function StudentDetailsModal({
@@ -49,6 +49,7 @@ export default function StudentDetailsModal({
       name:      student.name,
       parentage: student.parentage ?? '',
       phone:     student.phone,
+      address:   student.address ?? '',
     });
     setPhoto(student.photo ?? null);
     // Load custom values for this student
@@ -160,6 +161,7 @@ export default function StudentDetailsModal({
       name:      student.name,
       parentage: student.parentage ?? '',
       phone:     student.phone,
+      address:   student.address ?? '',
     });
     setPhoto(student.photo ?? null);
     if (closeModal) onClose();
