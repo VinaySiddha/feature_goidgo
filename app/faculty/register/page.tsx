@@ -1,0 +1,1041 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import { useAuth } from '@/components/AuthProvider';
+import { saveDraftToDb, getDraftsByUser, deleteDraftFromDb } from '@/lib/services/draft.service';
+import {
+  parseExcelFileServer, addStudentToDb, bulkAddStudentsToDb, getStudentCountStats,
+} from '@/lib/services/student.service';
+import { addAuditLog } from '@/lib/services/audit.service';
+import { StudentRecord, DraftRecord, CustomField } from '@/lib/types';
+import { getCustomFields, saveStudentCustomValues } from '@/lib/services/custom-fields.service';
+import {
+  FiUserPlus, FiUpload, FiDownload, FiX, FiCamera,
+  FiSave, FiCrop, FiTrash2, FiInbox, FiChevronDown,
+} from 'react-icons/fi';
+import CropModal from '@/components/CropModal';
+import { MdFlipCameraAndroid } from 'react-icons/md';
+import { formatISTDateTime } from '@/lib/formatDate';
+
+const EMPTY_FORM = {
+  college: '', name: '', parentage: '', phone: '',
+};
+type FormType = typeof EMPTY_FORM;
+
+function validateField(field: keyof FormType, value: string, form: FormType, existing: { phone: string; name: string }[]): string {
+  switch (field) {
+    case 'name':
+      if (!value.trim()) return 'Student name is required.';
+      if (value.trim().length < 2) return 'Name must be at least 2 characters.';
+      return '';
+    case 'parentage':
+      if (!value.trim()) return 'Father / Mother name is required.';
+      if (value.trim().length < 2) return 'Must be at least 2 characters.';
+      return '';
+    case 'phone': {
+      if (!value.trim()) return 'Contact number is required.';
+      const digits = value.replace(/\D/g, '');
+      if (digits.length !== 10) return 'Enter a valid 10-digit phone number.';
+      const dup = existing.find(s => s.phone.replace(/\D/g, '') === digits);
+      if (dup) return `Already registered for "${dup.name}".`;
+      return '';
+    }
+    default:
+      return '';
+  }
+}
+
+const Label = ({ text, optional }: { text: string; optional?: boolean }) => (
+  <span className="mb-1.5 block text-xs font-black uppercase tracking-widest text-slate-400">
+    {text}
+    {optional && <span className="ml-1 normal-case tracking-normal font-medium text-slate-300">(optional)</span>}
+  </span>
+);
+
+export default function FacultyRegisterPage() {
+  const { user, colleges } = useAuth();
+
+  const [form,             setForm]             = useState(EMPTY_FORM);
+  const [photoPreview,     setPhotoPreview]     = useState<string | null>(null);
+  const [uploadFile,       setUploadFile]       = useState<File | null>(null);
+  const [notice,           setNotice]           = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [submissionCount,  setSubmissionCount]  = useState(0);
+  const [confirmStudent,   setConfirmStudent]   = useState<StudentRecord | null>(null);
+  const [submitting,       setSubmitting]       = useState(false);
+  const [draftDeleteId,    setDraftDeleteId]    = useState<string | null>(null);
+  const [formErrors,       setFormErrors]       = useState<Partial<Record<keyof FormType, string>>>({});
+  const [touched,          setTouched]          = useState<Partial<Record<keyof FormType, boolean>>>({});
+  const [photoError,       setPhotoError]       = useState<string | null>(null);
+  const [bulkImportOpen,   setBulkImportOpen]   = useState(false);
+  const [importLoading,    setImportLoading]    = useState(false);
+  const [excelFile,        setExcelFile]        = useState<File | null>(null);
+  const [cropSource,       setCropSource]       = useState<string | null>(null);
+  const [cropTarget,       setCropTarget]       = useState<'main'>('main');
+  const [dbDrafts,         setDbDrafts]         = useState<DraftRecord[]>([]);
+  const [activeDraftId,    setActiveDraftId]    = useState<string | null>(null);
+  const [showDrafts,       setShowDrafts]       = useState(false);
+  const [draftSaving,      setDraftSaving]      = useState(false);
+  const [bulkPhotoMap,     setBulkPhotoMap]     = useState<Map<string, string>>(new Map());
+  const [previewRecords,   setPreviewRecords]   = useState<StudentRecord[] | null>(null);
+  const [batchProgress,    setBatchProgress]    = useState<{ current: number; total: number } | null>(null);
+  const [cameraOpen,       setCameraOpen]       = useState(false);
+  const [facingMode,       setFacingMode]       = useState<'user' | 'environment'>('user');
+
+  const [customFields,      setCustomFields]      = useState<CustomField[]>([]);
+  const [customValues,      setCustomValues]      = useState<Record<number, string>>({});
+  const [previewCustomVals, setPreviewCustomVals] = useState<Map<string, Record<number, string>>>(new Map());
+
+  const videoRef       = useRef<HTMLVideoElement>(null);
+  const streamRef      = useRef<MediaStream | null>(null);
+  const facingModeRef  = useRef<'user' | 'environment'>('user');
+
+  useEffect(() => {
+    if (!user) return;
+    const college = user.college || colleges[0] || '';
+    setForm(prev => ({ ...prev, college }));
+    const userKey = user.email || user.name || '';
+    if (userKey) getDraftsByUser(userKey).then(setDbDrafts);
+  }, [user, colleges]);
+
+  const facultyCollege = user?.college ?? '';
+  useEffect(() => {
+    if (!user) return;
+    const createdBy = user.name || user.email || '';
+    getStudentCountStats({ college: facultyCollege || undefined, createdBy })
+      .then(s => setSubmissionCount(s.total))
+      .catch(() => {});
+  }, [facultyCollege, user]);
+
+  useEffect(() => {
+    const col = user?.college || colleges[0] || '';
+    if (col) getCustomFields(col).then(setCustomFields).catch(() => {});
+  }, [user?.college, colleges]);
+
+  useEffect(() => {
+    if (cameraOpen && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [cameraOpen]);
+
+  // Warn on unsaved data when navigating away
+  const hasUnsavedData = () =>
+    form.name.trim() !== '' || form.phone.trim() !== '' ||
+    form.parentage.trim() !== '' || !!photoPreview;
+
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (hasUnsavedData()) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  });
+
+  if (!user) return null;
+
+  const facultyStudents: StudentRecord[] = []; // duplicate detection deferred to server
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  const clearDraft = (draftId?: string | null) => {
+    const id = draftId ?? activeDraftId;
+    if (id) {
+      deleteDraftFromDb(id).then(() => {
+        setDbDrafts(prev => prev.filter(d => d.id !== id));
+        setActiveDraftId(null);
+      });
+    }
+  };
+
+  const loadDbDraft = (draft: DraftRecord) => {
+    setForm(prev => ({
+      college:   prev.college,
+      name:      draft.name      ?? '',
+      parentage: draft.parentage ?? '',
+      phone:     draft.phone     ?? '',
+    }));
+    setPhotoPreview(draft.photo ?? null);
+    setActiveDraftId(draft.id);
+    setShowDrafts(false);
+    setNotice({ message: 'Draft loaded.', type: 'success' });
+    setTimeout(() => setNotice(null), 2500);
+  };
+
+  const deleteDbDraft = async (id: string) => {
+    await deleteDraftFromDb(id);
+    setDbDrafts(prev => prev.filter(d => d.id !== id));
+    if (activeDraftId === id) setActiveDraftId(null);
+  };
+
+  const saveToDb = async () => {
+    const userKey = user?.email || user?.name || '';
+    if (!userKey) return;
+    setDraftSaving(true);
+    const id = activeDraftId ?? `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const draft: DraftRecord = {
+      id,
+      college:   form.college,
+      name:      form.name,
+      phone:     form.phone,
+      parentage: form.parentage || undefined,
+      photo:     photoPreview   || undefined,
+      savedBy:   userKey,
+      updatedAt: new Date().toISOString(),
+    };
+    const result = await saveDraftToDb(draft);
+    if (result.success) {
+      setActiveDraftId(id);
+      setDbDrafts(prev => {
+        const without = prev.filter(d => d.id !== id);
+        return [{ ...draft }, ...without];
+      });
+      setNotice({ message: 'Draft saved.', type: 'success' });
+    } else {
+      setNotice({ message: 'Failed to save draft.', type: 'error' });
+    }
+    setTimeout(() => setNotice(null), 2500);
+    setDraftSaving(false);
+  };
+
+  const processImage = (src: string) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const MAX = 400;
+      let { width, height } = img;
+      if (width > height) { if (width > MAX) { height = Math.round(height * MAX / width); width = MAX; } }
+      else                { if (height > MAX) { width = Math.round(width * MAX / height); height = MAX; } }
+      canvas.width = width; canvas.height = height;
+      canvas.getContext('2d')?.drawImage(img, 0, 0, width, height);
+      setPhotoPreview(canvas.toDataURL('image/png'));
+    };
+    img.src = src;
+  };
+
+  const handlePhotoFile = (file: File | null) => {
+    if (!file) { setPhotoPreview(null); return; }
+    const MAX_MB = 5;
+    if (file.size > MAX_MB * 1024 * 1024) {
+      setPhotoError(`Photo must be under ${MAX_MB}MB (selected: ${(file.size / 1024 / 1024).toFixed(1)}MB)`);
+      setUploadFile(null);
+      return;
+    }
+    setPhotoError(null);
+    const reader = new FileReader();
+    reader.onload = e => {
+      const src = e.target?.result as string;
+      setCropTarget('main');
+      setCropSource(src);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const startCamera = async (mode: 'user' | 'environment' = facingModeRef.current) => {
+    try {
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+      let s: MediaStream;
+      try {
+        s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { exact: mode }, width: { ideal: 640 }, height: { ideal: 640 } } });
+      } catch {
+        s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: mode, width: { ideal: 640 }, height: { ideal: 640 } } });
+      }
+      streamRef.current = s;
+      facingModeRef.current = mode;
+      setFacingMode(mode);
+      setCameraOpen(true);
+    } catch {
+      setNotice({ message: 'Camera access denied or unavailable.', type: 'error' });
+    }
+  };
+
+  const flipCamera = async () => {
+    const next = facingModeRef.current === 'user' ? 'environment' : 'user';
+    await startCamera(next);
+  };
+
+  const captureFromCamera = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    const canvas = document.createElement('canvas');
+    const vw = video.videoWidth; const vh = video.videoHeight;
+    canvas.width = vw; canvas.height = vh;
+    canvas.getContext('2d')?.drawImage(video, 0, 0, vw, vh);
+    const src = canvas.toDataURL('image/png');
+    stopCamera();
+    setCropTarget('main');
+    setCropSource(src);
+  };
+
+  const stopCamera = () => {
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+    setCameraOpen(false);
+  };
+
+  const handleBulkPhotos = (files: FileList | null) => {
+    if (!files || files.length === 0) { setBulkPhotoMap(new Map()); return; }
+    const map = new Map<string, string>();
+    let pending = files.length;
+    Array.from(files).forEach(file => {
+      const stem = file.name.replace(/\.[^.]+$/, '').toLowerCase().trim();
+      const reader = new FileReader();
+      reader.onload = e => {
+        const src = e.target?.result as string;
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX = 400;
+          let { width, height } = img;
+          if (width > height) { if (width > MAX) { height = Math.round(height * MAX / width); width = MAX; } }
+          else                { if (height > MAX) { width = Math.round(width * MAX / height); height = MAX; } }
+          canvas.width = width; canvas.height = height;
+          canvas.getContext('2d')?.drawImage(img, 0, 0, width, height);
+          map.set(stem, canvas.toDataURL('image/png'));
+          pending--;
+          if (pending === 0) setBulkPhotoMap(new Map(map));
+        };
+        img.src = src;
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleFieldChange = (field: keyof FormType, value: string) => {
+    const next = { ...form, [field]: value };
+    setForm(next);
+    if (touched[field]) {
+      const err = validateField(field, value, next, facultyStudents.map(s => ({ phone: s.phone, name: s.name })));
+      setFormErrors(prev => ({ ...prev, [field]: err }));
+    }
+  };
+
+  const handleFieldBlur = (field: keyof FormType) => {
+    setTouched(prev => ({ ...prev, [field]: true }));
+    const err = validateField(field, form[field], form, facultyStudents.map(s => ({ phone: s.phone, name: s.name })));
+    setFormErrors(prev => ({ ...prev, [field]: err }));
+  };
+
+  const createStudent = (e: React.SyntheticEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const fields: (keyof FormType)[] = ['name', 'parentage', 'phone'];
+    const existing = facultyStudents.map(s => ({ phone: s.phone, name: s.name }));
+    const errors: Partial<Record<keyof FormType, string>> = {};
+    fields.forEach(f => {
+      const err = validateField(f, form[f], form, existing);
+      if (err) errors[f] = err;
+    });
+    setFormErrors(errors);
+    setTouched(Object.fromEntries(fields.map(f => [f, true])));
+    if (Object.keys(errors).length > 0) return;
+
+    setConfirmStudent({
+      id:        `${Date.now()}`,
+      college:   form.college,
+      name:      form.name,
+      parentage: form.parentage || undefined,
+      phone:     form.phone,
+      photo:     photoPreview   || undefined,
+      createdBy: user?.name || user?.email || 'Unknown',
+      createdAt: new Date().toISOString(),
+    });
+  };
+
+  const confirmAndSubmit = async () => {
+    if (!confirmStudent) return;
+    setSubmitting(true);
+    try {
+      await addStudentToDb(confirmStudent);
+      const cvEntries = Object.entries(customValues).map(([id, value]) => ({ custom_field_id: Number(id), value: value || null }));
+      if (cvEntries.length > 0) await saveStudentCustomValues(confirmStudent.id, cvEntries).catch(() => {});
+      setCustomValues({});
+      addAuditLog({
+        userEmail: user?.email ?? '',
+        userName:  user?.name  ?? '',
+        action:    'add_student',
+        entityType: 'student',
+        entityId:   confirmStudent.id,
+        details:    `Registered: ${confirmStudent.name} (${confirmStudent.college})`,
+      }).catch(() => {});
+      setConfirmStudent(null);
+      setForm(prev => ({ ...EMPTY_FORM, college: prev.college }));
+      setPhotoPreview(null);
+      setUploadFile(null);
+      setFormErrors({});
+      setTouched({});
+      setPhotoError(null);
+      clearDraft(activeDraftId);
+      setNotice({ message: 'Student registered successfully.', type: 'success' });
+      setTimeout(() => setNotice(null), 4000);
+    } catch {
+      setConfirmStudent(null);
+      setNotice({ message: 'Failed to save student record. Please try again.', type: 'error' });
+    }
+    setSubmitting(false);
+  };
+
+  const downloadTemplate = async () => {
+    const { writeExcelFile } = await import('@/lib/utils/excel');
+    const cfCols = customFields.reduce<Record<string, string>>((acc, cf) => {
+      acc[cf.label] = cf.options?.length ? cf.options.map(o => o.option_label).join(' / ') : '';
+      return acc;
+    }, {});
+    const rows = [
+      { Name: 'Rahul Sharma', 'Father/Mother Name': 'S/O Ramesh Sharma', Phone: '9876543210', ...cfCols },
+      { Name: 'Priya Verma',  'Father/Mother Name': 'D/O Suresh Verma',  Phone: '9876543211', ...cfCols },
+    ];
+    await writeExcelFile(rows, 'Students', 'student-import-template.xlsx');
+  };
+
+  const parseExcelForPreview = async () => {
+    if (!excelFile) { setNotice({ message: 'Select an Excel file first.', type: 'error' }); return; }
+    setImportLoading(true);
+    try {
+      const fd = new FormData();
+      fd.append('file', excelFile);
+      const { success, rows } = await parseExcelFileServer(fd);
+      if (!success || rows.length === 0) {
+        setNotice({ message: 'Excel file appears empty or invalid.', type: 'error' });
+        setImportLoading(false); return;
+      }
+      const [headers, ...values] = rows;
+      if (!headers || !Array.isArray(headers)) {
+        setNotice({ message: 'Excel file appears empty or invalid.', type: 'error' });
+        setImportLoading(false); return;
+      }
+      const norm = headers.map(h => String(h ?? '').trim().toLowerCase());
+      const dataRows = values.filter(r => Array.isArray(r) && r.some(v => String(v ?? '').trim()));
+      if (dataRows.length === 0) {
+        setNotice({ message: 'No data rows found in the file.', type: 'error' });
+        setImportLoading(false); return;
+      }
+      const cfValuesMap = new Map<string, Record<number, string>>();
+      const records = dataRows.map((row, i) => {
+        const e = Array.isArray(row)
+          ? row.reduce<Record<string, string>>((acc, v, idx) => { acc[norm[idx] ?? ''] = String(v ?? '').trim(); return acc; }, {})
+          : {};
+        const byIndex = bulkPhotoMap.get(String(i + 1));
+        const byName  = e.name ? bulkPhotoMap.get(e.name.toLowerCase().trim()) : undefined;
+        const photo   = byIndex ?? byName;
+        const id = `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 8)}`;
+        const cfVals: Record<number, string> = {};
+        for (const cf of customFields) {
+          const val = e[cf.label.toLowerCase().trim()];
+          if (val) cfVals[cf.id] = val;
+        }
+        if (Object.keys(cfVals).length) cfValuesMap.set(id, cfVals);
+        return {
+          id,
+          college:   user?.college || '',
+          name:      e.name        || 'Unnamed Student',
+          parentage: e['father/mother name'] || e.parentage || undefined,
+          phone:     e.phone || '',
+          photo:     photo   || undefined,
+          createdBy: user?.name || user?.email || 'Imported',
+          createdAt: new Date().toISOString(),
+        } as StudentRecord;
+      });
+      setPreviewCustomVals(cfValuesMap);
+      setPreviewRecords(records);
+    } catch {
+      setNotice({ message: 'Failed to parse Excel file. Make sure it is a valid .xlsx file.', type: 'error' });
+    }
+    setImportLoading(false);
+  };
+
+  const handleSaveAsDrafts = async () => {
+    if (!previewRecords) return;
+    setImportLoading(true);
+    const userKey = user?.name || user?.email || 'Unknown';
+    let saved = 0;
+    for (const record of previewRecords) {
+      const result = await saveDraftToDb({ ...record, savedBy: userKey }).catch(() => ({ success: false }));
+      if (result.success) saved++;
+    }
+    const drafts = await getDraftsByUser(userKey).catch(() => [] as typeof dbDrafts);
+    setDbDrafts(drafts);
+    setExcelFile(null); setBulkPhotoMap(new Map()); setPreviewRecords(null); setPreviewCustomVals(new Map()); setBulkImportOpen(false);
+    setNotice({ message: `${saved} of ${previewRecords.length} records saved as drafts.`, type: 'success' });
+    setTimeout(() => setNotice(null), 4000);
+    setImportLoading(false);
+  };
+
+  const handleConfirmImport = async () => {
+    if (!previewRecords) return;
+    setImportLoading(true);
+    const CHUNK = 10;
+    const total = previewRecords.length;
+    let saved = 0;
+    const allSaved: StudentRecord[] = [];
+    try {
+      for (let i = 0; i < total; i += CHUNK) {
+        setBatchProgress({ current: i, total });
+        const chunk = previewRecords.slice(i, i + CHUNK);
+        const result = await bulkAddStudentsToDb(chunk);
+        saved += result.saved;
+        for (let j = 0; j < chunk.length && allSaved.length < saved; j++) allSaved.push(chunk[j]);
+      }
+      setBatchProgress(null);
+      const cfSavePromises = allSaved
+        .filter(s => previewCustomVals.has(s.id))
+        .map(s => saveStudentCustomValues(s.id, previewCustomVals.get(s.id)!).catch(() => {}));
+      await Promise.all(cfSavePromises);
+      setExcelFile(null); setBulkPhotoMap(new Map()); setPreviewRecords(null); setPreviewCustomVals(new Map()); setBulkImportOpen(false);
+      setNotice({ message: `${saved} of ${total} records imported successfully.`, type: 'success' });
+      setTimeout(() => setNotice(null), 4000);
+    } catch {
+      setBatchProgress(null);
+      setNotice({ message: 'Import failed. Please try again.', type: 'error' });
+    }
+    setImportLoading(false);
+  };
+
+  const hasUnsaved = () =>
+    form.name.trim() !== '' || form.phone.trim() !== '' ||
+    form.parentage.trim() !== '' || !!photoPreview;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl sm:text-2xl font-black text-slate-900">Register Students</h1>
+          <p className="text-xs sm:text-sm text-slate-500 font-medium mt-0.5">Add new students manually or import via Excel</p>
+        </div>
+        <button
+          onClick={() => setBulkImportOpen(true)}
+          className="flex items-center gap-2 px-4 py-2.5 bg-slate-900 text-white font-black text-sm rounded hover:bg-blue-700 transition shadow-sm active:scale-95 shrink-0 self-start"
+        >
+          <FiUpload className="w-4 h-4" /> Bulk Import
+        </button>
+      </div>
+
+      {/* DB Drafts panel */}
+      {dbDrafts.length > 0 && (
+        <div className="bg-white rounded border border-slate-200 shadow-sm overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowDrafts(v => !v)}
+            className="w-full flex items-center justify-between px-4 py-3 hover:bg-slate-50 transition"
+          >
+            <span className="flex items-center gap-2 text-sm font-black text-slate-600">
+              <FiInbox className="w-4 h-4" />
+              Saved Drafts
+              <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-600 text-[0.65rem] font-black">{dbDrafts.length}</span>
+            </span>
+            <FiChevronDown className={`w-4 h-4 text-slate-400 transition-transform ${showDrafts ? 'rotate-180' : ''}`} />
+          </button>
+          {showDrafts && (
+            <div className="border-t border-slate-100 divide-y divide-slate-50">
+              {dbDrafts.map(draft => (
+                <div key={draft.id} className="flex items-center gap-3 px-4 py-3">
+                  {draft.photo
+                    ? <img src={draft.photo} alt="" className="w-10 h-10 rounded object-cover border border-slate-200 shrink-0" />
+                    : <div className="w-10 h-10 rounded bg-slate-100 border border-slate-200 shrink-0 flex items-center justify-center"><FiCamera className="w-4 h-4 text-slate-300" /></div>}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold text-slate-800 truncate">{draft.name || <span className="text-slate-400 font-medium italic">Unnamed draft</span>}</p>
+                    <p className="text-[0.6rem] text-slate-400 mt-0.5">
+                      {draft.course || draft.studentClass || draft.phone || '—'} · {formatISTDateTime(draft.updatedAt)}
+                    </p>
+                  </div>
+                  <div className="flex gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => loadDbDraft(draft)}
+                      className="px-3 py-1.5 text-xs font-black text-blue-600 bg-blue-50 hover:bg-blue-600 hover:text-white rounded border border-blue-100 transition"
+                    >
+                      Load
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDraftDeleteId(draft.id)}
+                      className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition"
+                    >
+                      <FiTrash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Manual form */}
+      <div className="bg-white rounded border border-slate-200 shadow-sm p-4 lg:p-6">
+        <div className="flex items-start gap-3 mb-6">
+          <div className="bg-blue-600 p-2.5 rounded text-white shrink-0">
+            <FiUserPlus className="w-4 h-4" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-base font-black text-slate-900">Manual Registration</h2>
+              {activeDraftId && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[0.65rem] font-bold bg-blue-100 text-blue-700 border border-blue-200">
+                  <FiInbox className="w-3 h-3" /> Editing draft
+                </span>
+              )}
+              {!activeDraftId && hasUnsaved() && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[0.65rem] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                  <FiSave className="w-3 h-3" /> Unsaved data
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-500 mt-0.5">Fields marked * are required</p>
+          </div>
+          <div className="shrink-0 text-right bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+            <p className="text-[0.55rem] font-black uppercase tracking-widest text-blue-500">Total Students</p>
+            <p className="text-xl font-black text-blue-700 leading-none">{submissionCount}</p>
+          </div>
+        </div>
+
+        <form onSubmit={createStudent} className="space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+
+            <label className="block sm:col-span-2">
+              <Label text="Institution" />
+              <input value={form.college} readOnly className="input-field bg-slate-50 text-slate-500 cursor-not-allowed text-sm" />
+            </label>
+
+            {/* Student Photograph */}
+            <div className="sm:col-span-2">
+              <Label text="Student Photograph" optional />
+              <div className="grid grid-cols-2 gap-2 mb-3">
+                <div className="relative">
+                  <input type="file" accept="image/*" onChange={e => { const f = e.target.files?.[0] ?? null; setUploadFile(f); handlePhotoFile(f); e.target.value = ''; }} className="opacity-0 absolute inset-0 w-full h-full z-10 cursor-pointer" />
+                  <button type="button" className="w-full flex items-center justify-center gap-2 border border-slate-200 bg-slate-50 text-slate-600 font-bold py-2.5 rounded hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition text-sm">
+                    <FiUpload className="w-4 h-4" /> Upload
+                  </button>
+                </div>
+                <button type="button" onClick={() => startCamera('user')} className="hidden sm:flex items-center justify-center gap-2 border border-slate-200 bg-slate-50 text-slate-600 font-bold py-2.5 rounded hover:bg-green-50 hover:border-green-300 hover:text-green-600 transition text-sm">
+                  <FiCamera className="w-4 h-4" /> Camera
+                </button>
+                <div className="relative sm:hidden col-span-2">
+                  <input type="file" accept="image/*" capture="environment" onChange={e => { const f = e.target.files?.[0] ?? null; setUploadFile(f); handlePhotoFile(f); e.target.value = ''; }} className="opacity-0 absolute inset-0 w-full h-full z-10 cursor-pointer" />
+                  <button type="button" className="w-full flex items-center justify-center gap-2 border border-slate-200 bg-slate-50 text-slate-600 font-bold py-2.5 rounded hover:bg-purple-50 hover:border-purple-300 hover:text-purple-600 transition text-sm">
+                    <FiCamera className="w-4 h-4" /> Take Photo
+                  </button>
+                </div>
+              </div>
+              {photoPreview ? (
+                <div className="flex items-center gap-3 p-3 rounded border border-slate-200 bg-slate-50">
+                  <img src={photoPreview} alt="Preview" className="w-14 h-14 object-cover rounded border border-slate-200 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold text-slate-700">Photo ready</p>
+                    <p className="text-xs text-slate-400">Saved as 400×400 PNG</p>
+                  </div>
+                  <div className="flex gap-1.5 shrink-0">
+                    <button type="button" onClick={() => { setCropTarget('main'); setCropSource(photoPreview); }} title="Re-crop" className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition">
+                      <FiCrop className="w-4 h-4" />
+                    </button>
+                    <button type="button" onClick={() => { setPhotoPreview(null); setUploadFile(null); }} className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition">
+                      <FiX className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-3 p-3 rounded border border-dashed border-slate-200 bg-slate-50/50 text-slate-400">
+                  <FiCamera className="w-5 h-5 shrink-0" />
+                  <p className="text-xs font-medium">No photo selected</p>
+                </div>
+              )}
+              {photoError && <p className="mt-1.5 text-xs font-bold text-rose-500">{photoError}</p>}
+            </div>
+
+            <label className="block sm:col-span-2">
+              <Label text="Student Name *" />
+              <input
+                value={form.name}
+                onChange={e => handleFieldChange('name', e.target.value)}
+                onBlur={() => handleFieldBlur('name')}
+                placeholder="Full legal name"
+                className={`input-field text-sm ${formErrors.name ? 'border-rose-400 focus:ring-rose-300' : touched.name && !formErrors.name && form.name ? 'border-emerald-400' : ''}`}
+              />
+              {formErrors.name ? <p className="mt-1 text-xs font-bold text-rose-500">{formErrors.name}</p> : touched.name && form.name && <p className="mt-1 text-xs font-bold text-emerald-500">✓ Looks good</p>}
+            </label>
+
+            <label className="block sm:col-span-2">
+              <Label text="Father Name / Mother Name *" />
+              <input
+                value={form.parentage}
+                onChange={e => handleFieldChange('parentage', e.target.value)}
+                onBlur={() => handleFieldBlur('parentage')}
+                placeholder="Enter father's name or mother's name"
+                className={`input-field text-sm ${formErrors.parentage ? 'border-rose-400 focus:ring-rose-300' : touched.parentage && !formErrors.parentage && form.parentage ? 'border-emerald-400' : ''}`}
+              />
+              {formErrors.parentage ? <p className="mt-1 text-xs font-bold text-rose-500">{formErrors.parentage}</p> : touched.parentage && form.parentage && <p className="mt-1 text-xs font-bold text-emerald-500">✓ Looks good</p>}
+            </label>
+
+            <label className="block">
+              <Label text="Contact Number *" />
+              <input
+                type="tel"
+                value={form.phone}
+                onChange={e => handleFieldChange('phone', e.target.value)}
+                onBlur={() => handleFieldBlur('phone')}
+                placeholder="10-digit number"
+                className={`input-field text-sm ${formErrors.phone ? 'border-rose-400 focus:ring-rose-300' : touched.phone && !formErrors.phone && form.phone ? 'border-emerald-400' : ''}`}
+              />
+              {formErrors.phone ? <p className="mt-1 text-xs font-bold text-rose-500">{formErrors.phone}</p> : touched.phone && form.phone && <p className="mt-1 text-xs font-bold text-emerald-500">✓ Valid number</p>}
+            </label>
+
+            {customFields.map(cf => (
+              <label key={cf.id} className={`block ${cf.field_type === 'TEXTAREA' ? 'sm:col-span-2' : ''}`}>
+                <Label text={cf.label} optional={!cf.is_required} />
+                {cf.field_type === 'TEXTAREA' ? (
+                  <textarea value={customValues[cf.id] ?? ''} onChange={e => setCustomValues(v => ({ ...v, [cf.id]: e.target.value }))} placeholder={cf.placeholder || ''} rows={2} className="input-field text-sm resize-none" required={cf.is_required} />
+                ) : cf.field_type === 'SELECT' ? (
+                  <select value={customValues[cf.id] ?? ''} onChange={e => setCustomValues(v => ({ ...v, [cf.id]: e.target.value }))} className="input-field text-sm" required={cf.is_required}>
+                    <option value="">Select…</option>
+                    {cf.options?.map(o => <option key={o.option_value} value={o.option_value}>{o.option_label}</option>)}
+                  </select>
+                ) : cf.field_type === 'RADIO' ? (
+                  <div className="flex flex-wrap gap-3 mt-1">
+                    {cf.options?.map(o => (
+                      <label key={o.option_value} className="flex items-center gap-1.5 text-sm font-medium text-slate-600 cursor-pointer">
+                        <input type="radio" name={`cf_${cf.id}`} value={o.option_value} checked={customValues[cf.id] === o.option_value} onChange={() => setCustomValues(v => ({ ...v, [cf.id]: o.option_value }))} className="accent-blue-600" required={cf.is_required && !customValues[cf.id]} />
+                        {o.option_label}
+                      </label>
+                    ))}
+                  </div>
+                ) : cf.field_type === 'CHECKBOX' ? (
+                  <div className="flex flex-wrap gap-3 mt-1">
+                    {cf.options?.map(o => {
+                      const vals = (customValues[cf.id] ?? '').split(',').filter(Boolean);
+                      const checked = vals.includes(o.option_value);
+                      return (
+                        <label key={o.option_value} className="flex items-center gap-1.5 text-sm font-medium text-slate-600 cursor-pointer">
+                          <input type="checkbox" value={o.option_value} checked={checked} onChange={() => { const next = checked ? vals.filter(v => v !== o.option_value) : [...vals, o.option_value]; setCustomValues(v => ({ ...v, [cf.id]: next.join(',') })); }} className="accent-blue-600" />
+                          {o.option_label}
+                        </label>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <input type={cf.field_type === 'NUMBER' ? 'number' : cf.field_type === 'DATE' ? 'date' : cf.field_type === 'EMAIL' ? 'email' : cf.field_type === 'PHONE' ? 'tel' : 'text'} value={customValues[cf.id] ?? ''} onChange={e => setCustomValues(v => ({ ...v, [cf.id]: e.target.value }))} placeholder={cf.placeholder || ''} className="input-field text-sm" required={cf.is_required} />
+                )}
+              </label>
+            ))}
+
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-3 pt-1">
+            <button type="submit" className="flex-1 bg-blue-600 text-white font-black py-3.5 rounded hover:bg-blue-700 transition shadow-sm active:scale-95 text-sm flex items-center justify-center gap-2">
+              <FiUserPlus className="w-4 h-4" /> Review &amp; Register
+            </button>
+            <button
+              type="button"
+              onClick={saveToDb}
+              disabled={draftSaving}
+              className="flex items-center justify-center gap-2 px-5 py-3.5 border border-slate-200 bg-white text-slate-600 font-black text-sm rounded hover:bg-slate-50 transition active:scale-95 disabled:opacity-60"
+            >
+              {draftSaving
+                ? <span className="w-3.5 h-3.5 rounded-full border-2 border-slate-300 border-t-slate-600 animate-spin" />
+                : <FiSave className="w-4 h-4" />}
+              Save Draft
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {/* Crop Modal */}
+      {cropSource && (
+        <CropModal
+          src={cropSource}
+          onConfirm={cropped => {
+            setCropSource(null);
+            setPhotoPreview(cropped);
+          }}
+          onCancel={() => {
+            if (!photoPreview) {
+              setCropSource(null);
+            } else {
+              processImage(cropSource);
+              setCropSource(null);
+            }
+          }}
+        />
+      )}
+
+      {/* Bulk Import Modal */}
+      {bulkImportOpen && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 p-0 sm:p-4" onClick={importLoading ? undefined : () => { setBulkImportOpen(false); setExcelFile(null); setBulkPhotoMap(new Map()); setPreviewRecords(null); }}>
+          <div className={`bg-white rounded-t-2xl sm:rounded-xl shadow-2xl w-full max-h-[92vh] flex flex-col transition-all duration-300 ${previewRecords ? 'sm:max-w-5xl' : 'sm:max-w-md'}`} onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100 shrink-0">
+              <div>
+                <h2 className="text-base font-black text-slate-900">Bulk Import</h2>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">Upload an Excel file to import multiple students at once</p>
+              </div>
+              <button onClick={() => { setBulkImportOpen(false); setExcelFile(null); setBulkPhotoMap(new Map()); setPreviewRecords(null); }} disabled={importLoading} className="w-8 h-8 flex items-center justify-center rounded text-slate-400 hover:text-slate-900 hover:bg-slate-100 transition disabled:opacity-30 disabled:pointer-events-none">
+                <FiX className="w-4 h-4" />
+              </button>
+            </div>
+
+            {previewRecords ? (
+              /* ── PREVIEW VIEW ── */
+              <>
+                <div className="px-5 py-3 border-b border-slate-100 shrink-0 flex items-center justify-between bg-slate-50">
+                  <div className="flex items-center gap-2">
+                    <span className="w-5 h-5 rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center shrink-0">
+                      <svg className="w-2.5 h-2.5 text-emerald-600" fill="none" viewBox="0 0 12 12" stroke="currentColor" strokeWidth="2.5"><path d="M2 6l3 3 5-5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    </span>
+                    <p className="text-xs font-black text-slate-700">{previewRecords.length} record{previewRecords.length !== 1 ? 's' : ''} parsed</p>
+                    <span className="text-slate-300">·</span>
+                    <p className="text-xs text-slate-400 font-medium">{previewRecords.filter(r => r.photo).length} with photo</p>
+                  </div>
+                  <button onClick={() => setPreviewRecords(null)} className="text-xs font-black text-slate-400 hover:text-slate-700 transition">← Back</button>
+                </div>
+                <div className="overflow-auto flex-1">
+                  <table className="w-full text-xs border-separate border-spacing-0" style={{ minWidth: '700px' }}>
+                    <thead className="sticky top-0 bg-slate-50 z-10">
+                      <tr>
+                        {['#','Photo','Name','Father/Mother Name','Phone'].map(h => (
+                          <th key={h} className="px-3 py-2.5 text-left text-[0.58rem] font-black uppercase tracking-widest text-slate-400 whitespace-nowrap border-b border-slate-200">{h}</th>
+                        ))}
+                        {customFields.map(cf => (
+                          <th key={cf.id} className="px-3 py-2.5 text-left text-[0.58rem] font-black uppercase tracking-widest text-blue-400 whitespace-nowrap border-b border-slate-200">{cf.label}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {previewRecords.map((r, i) => (
+                        <tr key={r.id} className="hover:bg-blue-50/30 transition">
+                          <td className="px-3 py-2.5 text-slate-400 font-black">{i + 1}</td>
+                          <td className="px-3 py-2.5">
+                            <div className="w-8 h-8 rounded overflow-hidden bg-slate-100 border border-slate-200 shrink-0">
+                              {r.photo
+                                ? <img src={r.photo} alt={r.name} className="w-full h-full object-cover" />
+                                : <div className="w-full h-full flex items-center justify-center text-[0.45rem] text-slate-300 font-black">NO</div>}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2.5 font-black text-slate-900 whitespace-nowrap">{r.name}</td>
+                          <td className="px-3 py-2.5 text-slate-600 whitespace-nowrap">{r.parentage || <span className="text-slate-300">—</span>}</td>
+                          <td className="px-3 py-2.5 text-slate-700 font-bold whitespace-nowrap">{r.phone || <span className="text-slate-300">—</span>}</td>
+                          {customFields.map(cf => (
+                            <td key={cf.id} className="px-3 py-2.5 text-blue-700 whitespace-nowrap">
+                              {previewCustomVals.get(r.id)?.[cf.id] || <span className="text-slate-300">—</span>}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="px-5 py-4 border-t border-slate-100 shrink-0 flex flex-col sm:flex-row gap-2">
+                  <button
+                    onClick={handleConfirmImport}
+                    disabled={importLoading}
+                    className="flex-1 flex flex-col items-center justify-center gap-1.5 bg-emerald-600 text-white font-black py-3 rounded-lg hover:bg-emerald-700 transition shadow-sm text-sm active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed overflow-hidden"
+                  >
+                    {importLoading && batchProgress ? (
+                      <>
+                        <span className="text-xs">Processing {Math.min(batchProgress.current + 50, batchProgress.total)} of {batchProgress.total}…</span>
+                        <div className="w-full bg-emerald-800/40 rounded-full h-1.5 mx-4" style={{ width: 'calc(100% - 2rem)' }}>
+                          <div className="bg-white h-1.5 rounded-full transition-all duration-300" style={{ width: `${Math.min(100, ((batchProgress.current + 50) / batchProgress.total) * 100)}%` }} />
+                        </div>
+                      </>
+                    ) : importLoading ? (
+                      <><span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin shrink-0" /> Saving…</>
+                    ) : (
+                      <><FiUpload className="w-4 h-4" /> Confirm & Import {previewRecords.length} Records</>
+                    )}
+                  </button>
+                  <button
+                    onClick={handleSaveAsDrafts}
+                    disabled={importLoading}
+                    className="flex items-center justify-center gap-2 px-4 py-3 rounded-lg border border-blue-200 bg-blue-50 text-blue-700 font-black text-sm hover:bg-blue-100 transition active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  >
+                    <FiSave className="w-4 h-4" /> Save as Drafts
+                  </button>
+                  <button onClick={() => setPreviewRecords(null)} disabled={importLoading} className="px-4 py-3 rounded-lg border border-slate-200 text-sm font-bold text-slate-600 hover:bg-slate-50 transition disabled:opacity-50 shrink-0">
+                    Back
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* ── UPLOAD VIEW ── */
+              <>
+                <div className="overflow-y-auto flex-1 p-5 space-y-4">
+                  <div className="rounded-lg border border-slate-200 p-4 space-y-3">
+                    <p className="text-[0.65rem] font-black uppercase tracking-widest text-slate-400">Step 1 — Download template</p>
+                    <p className="text-xs text-slate-500 font-medium">Columns match the registration form exactly. Required: <span className="font-black text-slate-700">Name, Father/Mother Name, Phone</span>.</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {['Name','Father/Mother Name','Phone'].map(col => (
+                        <span key={col} className="text-[0.6rem] font-black px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200">{col}</span>
+                      ))}
+                      {customFields.map(cf => (
+                        <span key={cf.id} className="text-[0.6rem] font-black px-2 py-0.5 rounded-full bg-blue-50 text-blue-500 border border-blue-200">{cf.label}</span>
+                      ))}
+                    </div>
+                    <button onClick={downloadTemplate} className="w-full flex items-center justify-center gap-2 border border-slate-200 bg-slate-50 text-slate-600 font-black py-2.5 rounded-lg hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition text-sm">
+                      <FiDownload className="w-4 h-4" /> Download Excel Template
+                    </button>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 p-4 space-y-3">
+                    <p className="text-[0.65rem] font-black uppercase tracking-widest text-slate-400">Step 2 — Upload your sheet</p>
+                    <div className="relative group">
+                      <input type="file" accept=".xlsx,.xls" onChange={e => setExcelFile(e.target.files?.[0] ?? null)} className="opacity-0 absolute inset-0 w-full h-full z-10 cursor-pointer" disabled={importLoading} />
+                      <div className={`p-6 rounded-lg border-2 border-dashed transition text-center space-y-2 ${excelFile ? 'border-blue-400 bg-blue-50' : 'border-slate-200 group-hover:border-blue-400 bg-slate-50/50'}`}>
+                        <FiUpload className={`w-6 h-6 mx-auto transition ${excelFile ? 'text-blue-500' : 'text-slate-300 group-hover:text-blue-400'}`} />
+                        <p className="text-sm font-bold text-slate-600">{excelFile ? excelFile.name : 'Drop Excel file here'}</p>
+                        <p className="text-xs text-slate-400">{excelFile ? 'Click to change file' : 'Click to browse — .xlsx or .xls'}</p>
+                      </div>
+                    </div>
+                    {excelFile && <button onClick={() => setExcelFile(null)} className="text-xs text-rose-500 hover:text-rose-700 font-bold transition">Remove file</button>}
+                  </div>
+                  <div className="rounded-lg border border-slate-200 p-4 space-y-3">
+                    <p className="text-[0.65rem] font-black uppercase tracking-widest text-slate-400">Step 3 — Student Photos <span className="normal-case tracking-normal font-medium text-slate-300">(optional)</span></p>
+                    <p className="text-xs text-slate-500 font-medium">
+                      Name each photo by <span className="font-black text-slate-700">row number</span> (1.jpg, 2.jpg…) or <span className="font-black text-slate-700">Student Name</span>.
+                    </p>
+                    <div className="relative group">
+                      <input type="file" accept="image/*" multiple onChange={e => handleBulkPhotos(e.target.files)} className="opacity-0 absolute inset-0 w-full h-full z-10 cursor-pointer" disabled={importLoading} />
+                      <div className={`p-5 rounded-lg border-2 border-dashed transition text-center space-y-2 ${bulkPhotoMap.size > 0 ? 'border-emerald-400 bg-emerald-50' : 'border-slate-200 group-hover:border-blue-400 bg-slate-50/50'}`}>
+                        <FiCamera className={`w-5 h-5 mx-auto transition ${bulkPhotoMap.size > 0 ? 'text-emerald-500' : 'text-slate-300 group-hover:text-blue-400'}`} />
+                        <p className="text-sm font-bold text-slate-600">
+                          {bulkPhotoMap.size > 0 ? `${bulkPhotoMap.size} photo${bulkPhotoMap.size !== 1 ? 's' : ''} selected` : 'Select student photos'}
+                        </p>
+                      </div>
+                    </div>
+                    {bulkPhotoMap.size > 0 && <button onClick={() => setBulkPhotoMap(new Map())} className="text-xs text-rose-500 hover:text-rose-700 font-bold transition">Clear photos</button>}
+                  </div>
+                </div>
+                <div className="px-5 py-4 border-t border-slate-100 shrink-0">
+                  <button
+                    onClick={parseExcelForPreview}
+                    disabled={importLoading || !excelFile}
+                    className="w-full flex items-center justify-center gap-2 bg-blue-600 text-white font-black py-3 rounded-lg hover:bg-blue-700 transition shadow-sm text-sm active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {importLoading
+                      ? <><span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin shrink-0" /> Parsing…</>
+                      : <><FiUpload className="w-4 h-4" /> Preview Records</>}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Confirm Registration Modal */}
+      {confirmStudent && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 p-0 sm:p-4">
+          <div className="bg-white rounded-t-2xl sm:rounded-xl shadow-2xl w-full max-w-md max-h-[92vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="sticky top-0 bg-white border-b border-slate-100 px-5 py-4 flex items-center justify-between rounded-t-2xl sm:rounded-t-xl">
+              <div>
+                <h2 className="text-base font-black text-slate-900">Confirm Registration</h2>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">Review details before saving</p>
+              </div>
+              <button onClick={() => setConfirmStudent(null)} disabled={submitting} className="w-8 h-8 flex items-center justify-center rounded text-slate-400 hover:text-slate-900 hover:bg-slate-100 transition disabled:opacity-30 disabled:pointer-events-none">
+                <FiX className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 space-y-5">
+              <div className="flex items-center gap-4 p-4 bg-blue-50 rounded-lg border border-blue-100">
+                <div className="w-16 h-16 rounded-lg border-2 border-blue-200 bg-white overflow-hidden shrink-0 flex items-center justify-center">
+                  {confirmStudent.photo
+                    ? <img src={confirmStudent.photo} alt="Photo" className="w-full h-full object-cover" />
+                    : <FiCamera className="w-6 h-6 text-slate-300" />}
+                </div>
+                <div className="min-w-0">
+                  <p className="font-black text-slate-900 text-base leading-tight truncate">{confirmStudent.name}</p>
+                  {confirmStudent.parentage && <p className="text-xs text-slate-500 font-medium mt-0.5">{confirmStudent.parentage}</p>}
+                  <p className="text-xs text-blue-600 font-bold mt-1">{confirmStudent.college}</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                {[{ label: 'Phone', value: confirmStudent.phone }].filter(f => f.value).map(({ label, value }) => (
+                  <div key={label} className="bg-slate-50 rounded-lg px-3 py-2.5 border border-slate-100">
+                    <p className="text-[0.6rem] font-black uppercase tracking-widest text-slate-400">{label}</p>
+                    <p className="text-sm font-bold text-slate-700 mt-0.5 truncate">{value}</p>
+                  </div>
+                ))}
+              </div>
+              {!confirmStudent.photo && <p className="text-xs text-slate-400 font-medium text-center">No photo attached.</p>}
+            </div>
+            <div className="sticky bottom-0 bg-white border-t border-slate-100 px-5 py-4 flex gap-3">
+              <button
+                onClick={confirmAndSubmit}
+                disabled={submitting}
+                className="flex-1 flex items-center justify-center gap-2 bg-blue-600 text-white font-black py-3 rounded-lg hover:bg-blue-700 transition shadow-sm active:scale-95 text-sm disabled:opacity-60"
+              >
+                {submitting
+                  ? <><span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /> Registering…</>
+                  : <><FiUserPlus className="w-4 h-4" /> Confirm Registration</>}
+              </button>
+              <button onClick={() => setConfirmStudent(null)} disabled={submitting} className="px-5 py-3 rounded-lg border border-slate-200 text-sm font-bold text-slate-600 hover:bg-slate-50 transition disabled:opacity-60">
+                Edit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Camera Modal */}
+      {cameraOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm sm:max-w-md lg:max-w-lg overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
+              <h3 className="font-black text-slate-900 text-sm">Capture Photo</h3>
+              <div className="flex items-center gap-2">
+                <button onClick={flipCamera} title="Flip camera" className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-slate-900 hover:bg-slate-100 transition">
+                  <MdFlipCameraAndroid className="w-4 h-4" />
+                </button>
+                <button onClick={stopCamera} className="w-7 h-7 flex items-center justify-center rounded text-slate-400 hover:text-slate-900 hover:bg-slate-100 transition">
+                  <FiX className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <div className="relative bg-black">
+              <video ref={videoRef} autoPlay playsInline muted className="w-full aspect-square object-cover bg-black" />
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div className="w-48 h-48 border-2 border-white/50 rounded-lg" style={{ boxShadow: '0 0 0 9999px rgba(0,0,0,0.35)' }} />
+              </div>
+              <p className="absolute bottom-2 left-0 right-0 text-center text-white/60 text-[0.6rem] font-bold">
+                {facingMode === 'user' ? 'Front camera' : 'Back camera'}
+              </p>
+            </div>
+            <div className="p-4">
+              <button type="button" onClick={captureFromCamera} className="w-full bg-blue-600 text-white font-black py-3 rounded-lg hover:bg-blue-700 transition active:scale-95 flex items-center justify-center gap-2">
+                <FiCamera className="w-4 h-4" /> Take Photo
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Draft delete confirmation */}
+      {draftDeleteId && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-xs overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-100">
+              <h3 className="font-black text-slate-900 text-base">Delete Draft?</h3>
+              <p className="text-xs text-slate-500 mt-1">This draft will be permanently deleted and cannot be recovered.</p>
+            </div>
+            <div className="p-4 flex gap-2">
+              <button
+                onClick={async () => { await deleteDbDraft(draftDeleteId); setDraftDeleteId(null); }}
+                className="flex-1 bg-rose-500 text-white font-black py-2.5 rounded-lg hover:bg-rose-600 transition text-sm active:scale-95"
+              >
+                Delete
+              </button>
+              <button
+                onClick={() => setDraftDeleteId(null)}
+                className="flex-1 border border-slate-200 text-slate-600 font-black py-2.5 rounded-lg hover:bg-slate-50 transition text-sm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast */}
+      {notice && (
+        <div className={`fixed bottom-20 lg:bottom-6 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-lg shadow-2xl flex items-center gap-2.5 font-black text-sm border-2 max-w-[calc(100vw-2rem)] ${notice.type === 'success' ? 'bg-emerald-500/90 text-white border-emerald-400/50' : 'bg-rose-500/90 text-white border-rose-400/50'}`}>
+          <span className="truncate">{notice.message}</span>
+        </div>
+      )}
+    </div>
+  );
+}

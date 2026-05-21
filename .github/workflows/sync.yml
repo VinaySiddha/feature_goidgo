@@ -1,0 +1,23 @@
+name: Sync Fork
+
+on:
+  repository_dispatch:
+    types: [sync_fork]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync upstream
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: Vikaskoppoju/Collect_Student_data
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.PAT_TOKEN }}
